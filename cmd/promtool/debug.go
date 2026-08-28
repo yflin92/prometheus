@@ -35,29 +35,10 @@ func debugWrite(cfg debugWriterConfig) error {
 
 	for _, endPointGroup := range cfg.endPointGroups {
 		for url, filename := range endPointGroup.urlToFilename {
-			url := cfg.serverURL + url
-			fmt.Println("collecting:", url)
-			res, err := http.Get(url)
-			if err != nil {
-				return errors.Wrap(err, "error executing HTTP request")
-			}
-			body, err := ioutil.ReadAll(res.Body)
-			res.Body.Close()
-			if err != nil {
-				return errors.Wrap(err, "error reading the response body")
-			}
-
-			if endPointGroup.postProcess != nil {
-				body, err = endPointGroup.postProcess(body)
-				if err != nil {
-					return errors.Wrap(err, "error post-processing HTTP response body")
-				}
-			}
-			if err := archiver.write(filename, body); err != nil {
-				return errors.Wrap(err, "error writing into the archive")
+			if err := collectEndpoint(archiver, endPointGroup, cfg.serverURL+url, filename); err != nil {
+				return err
 			}
 		}
-
 	}
 
 	if err := archiver.close(); err != nil {
@@ -65,5 +46,31 @@ func debugWrite(cfg debugWriterConfig) error {
 	}
 
 	fmt.Printf("Compiling debug information complete, all files written in %q.\n", cfg.tarballName)
+	return nil
+}
+
+// collectEndpoint fetches a single debug endpoint, optionally post-processes
+// the response, and writes the result into the archive.
+func collectEndpoint(archiver *tarGzFileWriter, endPointGroup endpointsGroup, url, filename string) error {
+	fmt.Println("collecting:", url)
+	res, err := http.Get(url)
+	if err != nil {
+		return errors.Wrap(err, "error executing HTTP request")
+	}
+	body, err := ioutil.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		return errors.Wrap(err, "error reading the response body")
+	}
+
+	if endPointGroup.postProcess != nil {
+		body, err = endPointGroup.postProcess(body)
+		if err != nil {
+			return errors.Wrap(err, "error post-processing HTTP response body")
+		}
+	}
+	if err := archiver.write(filename, body); err != nil {
+		return errors.Wrap(err, "error writing into the archive")
+	}
 	return nil
 }
