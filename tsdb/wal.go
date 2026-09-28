@@ -566,24 +566,22 @@ func (w *SegmentWAL) cut() error {
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
 		// in the new segment.
-		go func() {
-			w.actorc <- func() error {
-				off, err := hf.Seek(0, io.SeekCurrent)
-				if err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				if err := hf.Truncate(off); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				if err := hf.Sync(); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				if err := hf.Close(); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				return nil
+		w.enqueue(func() error {
+			off, err := hf.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
 			}
-		}()
+			if err := hf.Truncate(off); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			if err := hf.Sync(); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			if err := hf.Close(); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			return nil
+		})
 	}
 
 	p, _, err := nextSequenceFile(w.dirFile.Name())
@@ -595,11 +593,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
-	go func() {
-		w.actorc <- func() error {
-			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
-		}
-	}()
+	w.enqueue(func() error {
+		return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
+	})
 
 	w.files = append(w.files, newSegmentFile(f))
 
@@ -663,6 +659,18 @@ func (w *SegmentWAL) flush() error {
 		return nil
 	}
 	return w.cur.Flush()
+}
+
+// enqueue hands f to the background actor without blocking the caller.
+// If the WAL is closed first, f is dropped: the actor stops receiving
+// once stopc is closed, so waiting would block forever.
+func (w *SegmentWAL) enqueue(f func() error) {
+	go func() {
+		select {
+		case w.actorc <- f:
+		case <-w.stopc:
+		}
+	}()
 }
 
 func (w *SegmentWAL) run(interval time.Duration) {
