@@ -307,6 +307,7 @@ func TestInitialUpdate(t *testing.T) {
 		"fixtures/valid.yml",
 		"fixtures/valid.json",
 	} {
+		tc := tc
 		t.Run(tc, func(t *testing.T) {
 			t.Parallel()
 
