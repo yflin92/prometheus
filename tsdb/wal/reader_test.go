@@ -337,7 +337,8 @@ func TestReaderFuzz(t *testing.T) {
 				reader := fn(sr)
 				for expected := range input {
 					testutil.Assert(t, reader.Next(), "expected record: %v", reader.Err())
-					testutil.Equals(t, expected, reader.Record(), "read wrong record")
+					// bytes.Equal treats an empty expected record and a nil read record as equal.
+					testutil.Assert(t, bytes.Equal(expected, reader.Record()), "read wrong record")
 				}
 				testutil.Assert(t, !reader.Next(), "unexpected record")
 			})
@@ -387,7 +388,8 @@ func TestReaderFuzz_Live(t *testing.T) {
 					rec := r.Record()
 					expected, ok := <-input
 					testutil.Assert(t, ok, "unexpected record")
-					testutil.Equals(t, expected, rec, "record does not match expected")
+					// bytes.Equal treats an empty expected record and a nil read record as equal.
+					testutil.Assert(t, bytes.Equal(expected, rec), "record does not match expected")
 				}
 				testutil.Assert(t, r.Err() == io.EOF, "expected EOF, got: %v", r.Err())
 				return true
