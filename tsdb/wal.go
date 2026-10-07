@@ -566,24 +566,22 @@ func (w *SegmentWAL) cut() error {
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
 		// in the new segment.
-		go func() {
-			w.actorc <- func() error {
-				off, err := hf.Seek(0, io.SeekCurrent)
-				if err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				if err := hf.Truncate(off); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				if err := hf.Sync(); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				if err := hf.Close(); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				return nil
+		go w.enqueue(func() error {
+			off, err := hf.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
 			}
-		}()
+			if err := hf.Truncate(off); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			if err := hf.Sync(); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			if err := hf.Close(); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			return nil
+		})
 	}
 
 	p, _, err := nextSequenceFile(w.dirFile.Name())
@@ -595,11 +593,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
-	go func() {
-		w.actorc <- func() error {
-			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
-		}
-	}()
+	go w.enqueue(func() error {
+		return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
+	})
 
 	w.files = append(w.files, newSegmentFile(f))
 
@@ -608,6 +604,15 @@ func (w *SegmentWAL) cut() error {
 	w.curN = 8
 
 	return nil
+}
+
+// enqueue hands f to the run loop. It gives up once the WAL is closed so
+// that callers running it in a goroutine do not block forever.
+func (w *SegmentWAL) enqueue(f func() error) {
+	select {
+	case w.actorc <- f:
+	case <-w.stopc:
+	}
 }
 
 func (w *SegmentWAL) head() *segmentFile {
