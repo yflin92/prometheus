@@ -81,3 +81,25 @@ func TestRefresh(t *testing.T) {
 	case <-tick.C:
 	}
 }
+
+type observerFunc func(float64)
+
+func (f observerFunc) Observe(v float64) { f(v) }
+
+func TestRefreshObservesDuration(t *testing.T) {
+	const delay = 20 * time.Millisecond
+
+	d := NewDiscovery(nil, "test", time.Minute, func(context.Context) ([]*targetgroup.Group, error) {
+		time.Sleep(delay)
+		return nil, nil
+	})
+	var observed []float64
+	d.duration = observerFunc(func(v float64) { observed = append(observed, v) })
+
+	_, err := d.refresh(context.Background())
+	testutil.Ok(t, err)
+
+	// The duration must cover the refresh call, not be taken when the defer is set up.
+	testutil.Equals(t, 1, len(observed))
+	testutil.Assert(t, observed[0] >= delay.Seconds(), "expected duration >= %v, got %vs", delay, observed[0])
+}
