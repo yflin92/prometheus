@@ -164,6 +164,7 @@ type SegmentWAL struct {
 	stopc   chan struct{}
 	donec   chan struct{}
 	actorc  chan func() error // sequentialized background operations
+	actorWG sync.WaitGroup    // tracks goroutines still enqueuing to actorc
 	buffers sync.Pool
 }
 
@@ -566,7 +567,9 @@ func (w *SegmentWAL) cut() error {
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
 		// in the new segment.
+		w.actorWG.Add(1)
 		go func() {
+			defer w.actorWG.Done()
 			w.actorc <- func() error {
 				off, err := hf.Seek(0, io.SeekCurrent)
 				if err != nil {
@@ -595,7 +598,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
+	w.actorWG.Add(1)
 	go func() {
+		defer w.actorWG.Done()
 		w.actorc <- func() error {
 			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
 		}
@@ -710,6 +715,9 @@ func (w *SegmentWAL) Close() error {
 	default:
 	}
 
+	// Let pending background operations reach the actor before stopping it,
+	// so they run instead of blocking forever on actorc.
+	w.actorWG.Wait()
 	close(w.stopc)
 	<-w.donec
 
