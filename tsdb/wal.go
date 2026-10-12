@@ -693,7 +693,17 @@ func (w *SegmentWAL) run(interval time.Duration) {
 		}
 		select {
 		case <-w.stopc:
-			return
+			// Run operations still queued when Close stopped the actor.
+			for {
+				select {
+				case f := <-w.actorc:
+					if err := f(); err != nil {
+						level.Error(w.logger).Log("msg", "operation failed", "err", err)
+					}
+				default:
+					return
+				}
+			}
 		case f := <-w.actorc:
 			if err := f(); err != nil {
 				level.Error(w.logger).Log("msg", "operation failed", "err", err)
@@ -715,8 +725,8 @@ func (w *SegmentWAL) Close() error {
 	default:
 	}
 
-	// Let pending background operations reach the actor before stopping it,
-	// so they run instead of blocking forever on actorc.
+	// Let pending background operations reach actorc before stopping the
+	// actor, which runs whatever is still queued before it exits.
 	w.actorWG.Wait()
 	close(w.stopc)
 	<-w.donec

@@ -115,8 +115,16 @@ func TestHeadReadWriter_WriteChunk_Chunk_IterateChunks(t *testing.T) {
 	fileEnd := HeadChunkFileHeaderSize + len(expectedBytes)
 	testutil.Equals(t, expectedBytes, actualBytes[HeadChunkFileHeaderSize:fileEnd])
 
-	// The file must end right after the last chunk; nothing else is written.
-	testutil.Equals(t, fileEnd, len(actualBytes))
+	// Test for the next chunk header to be all 0s. That marks the end of the file.
+	// The file only extends past fileEnd where it is preallocated (Windows).
+	testutil.Assert(t, len(actualBytes) >= fileEnd, "file is shorter than the written chunks")
+	nextHeaderEnd := fileEnd + MaxHeadChunkMetaSize
+	if nextHeaderEnd > len(actualBytes) {
+		nextHeaderEnd = len(actualBytes)
+	}
+	for _, b := range actualBytes[fileEnd:nextHeaderEnd] {
+		testutil.Equals(t, byte(0), b)
+	}
 
 	// Testing reading of chunks.
 	for _, exp := range expectedData {
