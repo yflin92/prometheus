@@ -164,6 +164,7 @@ type SegmentWAL struct {
 	stopc   chan struct{}
 	donec   chan struct{}
 	actorc  chan func() error // sequentialized background operations
+	actorWG sync.WaitGroup    // tracks goroutines still enqueuing to actorc
 	buffers sync.Pool
 }
 
@@ -566,7 +567,9 @@ func (w *SegmentWAL) cut() error {
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
 		// in the new segment.
+		w.actorWG.Add(1)
 		go func() {
+			defer w.actorWG.Done()
 			w.actorc <- func() error {
 				off, err := hf.Seek(0, io.SeekCurrent)
 				if err != nil {
@@ -595,7 +598,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
+	w.actorWG.Add(1)
 	go func() {
+		defer w.actorWG.Done()
 		w.actorc <- func() error {
 			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
 		}
@@ -678,26 +683,38 @@ func (w *SegmentWAL) run(interval time.Duration) {
 	for {
 		// Processing all enqueued operations has precedence over shutdown and
 		// background syncs.
-		select {
-		case f := <-w.actorc:
-			if err := f(); err != nil {
-				level.Error(w.logger).Log("msg", "operation failed", "err", err)
-			}
-			continue
-		default:
-		}
+		w.runQueuedOps()
+
 		select {
 		case <-w.stopc:
+			// Run operations still queued when Close stopped the actor.
+			w.runQueuedOps()
 			return
 		case f := <-w.actorc:
-			if err := f(); err != nil {
-				level.Error(w.logger).Log("msg", "operation failed", "err", err)
-			}
+			w.runOp(f)
 		case <-tick:
 			if err := w.Sync(); err != nil {
 				level.Error(w.logger).Log("msg", "sync failed", "err", err)
 			}
 		}
+	}
+}
+
+// runQueuedOps runs the operations already queued on actorc without blocking.
+func (w *SegmentWAL) runQueuedOps() {
+	for {
+		select {
+		case f := <-w.actorc:
+			w.runOp(f)
+		default:
+			return
+		}
+	}
+}
+
+func (w *SegmentWAL) runOp(f func() error) {
+	if err := f(); err != nil {
+		level.Error(w.logger).Log("msg", "operation failed", "err", err)
 	}
 }
 
@@ -710,6 +727,9 @@ func (w *SegmentWAL) Close() error {
 	default:
 	}
 
+	// Let pending background operations reach actorc before stopping the
+	// actor, which runs whatever is still queued before it exits.
+	w.actorWG.Wait()
 	close(w.stopc)
 	<-w.donec
 

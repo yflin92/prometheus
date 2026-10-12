@@ -1054,6 +1054,48 @@ func TestTombstoneClean(t *testing.T) {
 // TestTombstoneCleanFail tests that a failing TombstoneClean doesn't leave any blocks behind.
 // When TombstoneClean errors the original block that should be rebuilt doesn't get deleted so
 // if TombstoneClean leaves any blocks behind these will overlap.
+// slowWriteCompactor delays Write so that CleanTombstones takes a known minimum time.
+type slowWriteCompactor struct {
+	Compactor
+	delay time.Duration
+}
+
+func (c slowWriteCompactor) Write(dest string, b BlockReader, mint, maxt int64, parent *BlockMeta) (ulid.ULID, error) {
+	time.Sleep(c.delay)
+	return c.Compactor.Write(dest, b, mint, maxt, parent)
+}
+
+// observedHistogram records the values passed to Observe.
+type observedHistogram struct {
+	prometheus.Histogram
+	observed []float64
+}
+
+func (h *observedHistogram) Observe(v float64) { h.observed = append(h.observed, v) }
+
+func TestCleanTombstonesObservesDuration(t *testing.T) {
+	const delay = 20 * time.Millisecond
+
+	db := openTestDB(t, nil, nil)
+	defer func() {
+		testutil.Ok(t, db.Close())
+	}()
+
+	createBlock(t, db.Dir(), genSeries(1, 1, 0, 10))
+	testutil.Ok(t, db.reload())
+	testutil.Ok(t, db.Delete(0, 5, labels.MustNewMatcher(labels.MatchRegexp, defaultLabelName, ".+")))
+
+	db.compactor = slowWriteCompactor{Compactor: db.compactor, delay: delay}
+	timer := &observedHistogram{}
+	db.metrics.tombCleanTimer = timer
+
+	testutil.Ok(t, db.CleanTombstones())
+
+	// The duration must cover the cleanup, not be taken when the defer is set up.
+	testutil.Equals(t, 1, len(timer.observed))
+	testutil.Assert(t, timer.observed[0] >= delay.Seconds(), "expected duration >= %v, got %vs", delay, timer.observed[0])
+}
+
 func TestTombstoneCleanFail(t *testing.T) {
 	db := openTestDB(t, nil, nil)
 	defer func() {
