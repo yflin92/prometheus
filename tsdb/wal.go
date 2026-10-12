@@ -683,36 +683,38 @@ func (w *SegmentWAL) run(interval time.Duration) {
 	for {
 		// Processing all enqueued operations has precedence over shutdown and
 		// background syncs.
-		select {
-		case f := <-w.actorc:
-			if err := f(); err != nil {
-				level.Error(w.logger).Log("msg", "operation failed", "err", err)
-			}
-			continue
-		default:
-		}
+		w.runQueuedOps()
+
 		select {
 		case <-w.stopc:
 			// Run operations still queued when Close stopped the actor.
-			for {
-				select {
-				case f := <-w.actorc:
-					if err := f(); err != nil {
-						level.Error(w.logger).Log("msg", "operation failed", "err", err)
-					}
-				default:
-					return
-				}
-			}
+			w.runQueuedOps()
+			return
 		case f := <-w.actorc:
-			if err := f(); err != nil {
-				level.Error(w.logger).Log("msg", "operation failed", "err", err)
-			}
+			w.runOp(f)
 		case <-tick:
 			if err := w.Sync(); err != nil {
 				level.Error(w.logger).Log("msg", "sync failed", "err", err)
 			}
 		}
+	}
+}
+
+// runQueuedOps runs the operations already queued on actorc without blocking.
+func (w *SegmentWAL) runQueuedOps() {
+	for {
+		select {
+		case f := <-w.actorc:
+			w.runOp(f)
+		default:
+			return
+		}
+	}
+}
+
+func (w *SegmentWAL) runOp(f func() error) {
+	if err := f(); err != nil {
+		level.Error(w.logger).Log("msg", "operation failed", "err", err)
 	}
 }
 
