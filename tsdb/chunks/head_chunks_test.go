@@ -116,7 +116,12 @@ func TestHeadReadWriter_WriteChunk_Chunk_IterateChunks(t *testing.T) {
 	testutil.Equals(t, expectedBytes, actualBytes[HeadChunkFileHeaderSize:fileEnd])
 
 	// Test for the next chunk header to be all 0s. That marks the end of the file.
-	for _, b := range actualBytes[fileEnd:] {
+	// The file is only preallocated on some platforms, so it may end at fileEnd.
+	headerEnd := fileEnd + MaxHeadChunkMetaSize
+	if headerEnd > len(actualBytes) {
+		headerEnd = len(actualBytes)
+	}
+	for _, b := range actualBytes[fileEnd:headerEnd] {
 		testutil.Equals(t, byte(0), b)
 	}
 
