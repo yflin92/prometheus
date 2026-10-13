@@ -36,6 +36,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -50,7 +51,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m,
+		goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func1"),
+		goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func2"),
+	)
 }
 
 func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB) {
@@ -1002,7 +1006,17 @@ func TestTombstoneClean(t *testing.T) {
 		}
 
 		// All of the setup for THIS line.
+		cleanStart := time.Now()
 		testutil.Ok(t, db.CleanTombstones())
+		cleanElapsed := time.Since(cleanStart)
+
+		// The cleanup timer must cover the whole call, not just its setup.
+		// The bound is loose because the call also includes lock acquisition.
+		m := &dto.Metric{}
+		testutil.Ok(t, db.metrics.tombCleanTimer.Write(m))
+		testutil.Equals(t, uint64(1), m.GetHistogram().GetSampleCount())
+		testutil.Assert(t, m.GetHistogram().GetSampleSum() >= cleanElapsed.Seconds()/10,
+			"tombstone cleanup duration %vs is far below the call duration %v", m.GetHistogram().GetSampleSum(), cleanElapsed)
 
 		// Compare the result.
 		q, err := db.Querier(context.TODO(), 0, numSamples)
