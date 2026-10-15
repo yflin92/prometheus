@@ -565,9 +565,10 @@ func (w *SegmentWAL) cut() error {
 			return err
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
-		// in the new segment.
+		// in the new segment. The operation is dropped if the WAL is closed
+		// before it is enqueued, so the goroutine never blocks forever.
 		go func() {
-			w.actorc <- func() error {
+			w.enqueue(func() error {
 				off, err := hf.Seek(0, io.SeekCurrent)
 				if err != nil {
 					return errors.Wrapf(err, "finish old segment %s", hf.Name())
@@ -582,7 +583,7 @@ func (w *SegmentWAL) cut() error {
 					return errors.Wrapf(err, "finish old segment %s", hf.Name())
 				}
 				return nil
-			}
+			})
 		}()
 	}
 
@@ -595,11 +596,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
-	go func() {
-		w.actorc <- func() error {
-			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
-		}
-	}()
+	go w.enqueue(func() error {
+		return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
+	})
 
 	w.files = append(w.files, newSegmentFile(f))
 
@@ -608,6 +607,15 @@ func (w *SegmentWAL) cut() error {
 	w.curN = 8
 
 	return nil
+}
+
+// enqueue hands f to the run loop for sequential execution. It gives up
+// without running f once the WAL has been closed.
+func (w *SegmentWAL) enqueue(f func() error) {
+	select {
+	case w.actorc <- f:
+	case <-w.stopc:
+	}
 }
 
 func (w *SegmentWAL) head() *segmentFile {
