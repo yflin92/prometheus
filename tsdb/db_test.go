@@ -50,7 +50,9 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	// The deprecated SegmentWAL syncs its directory from a fire-and-forget
+	// goroutine that can outlive Close.
+	goleak.VerifyTestMain(m, goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func2"))
 }
 
 func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB) {
@@ -1093,6 +1095,36 @@ func TestTombstoneCleanFail(t *testing.T) {
 	actualBlockDirs, err := blockDirs(db.dir)
 	testutil.Ok(t, err)
 	testutil.Equals(t, expectedBlockDirs, actualBlockDirs)
+}
+
+type recordingHistogram struct {
+	prometheus.Histogram
+	observed []float64
+}
+
+func (h *recordingHistogram) Observe(v float64) { h.observed = append(h.observed, v) }
+
+// TestCleanTombstonesObservesDuration tests that the tombstone cleanup duration
+// covers the whole call. Holding db.mtx stalls CleanTombstones after its timer
+// has started.
+func TestCleanTombstonesObservesDuration(t *testing.T) {
+	db := openTestDB(t, nil, nil)
+	defer func() {
+		testutil.Ok(t, db.Close())
+	}()
+	timer := &recordingHistogram{Histogram: db.metrics.tombCleanTimer}
+	db.metrics.tombCleanTimer = timer
+
+	const delay = 20 * time.Millisecond
+	db.mtx.Lock()
+	go func() {
+		time.Sleep(delay)
+		db.mtx.Unlock()
+	}()
+	testutil.Ok(t, db.CleanTombstones())
+
+	testutil.Equals(t, 1, len(timer.observed))
+	testutil.Assert(t, timer.observed[0] >= (delay/2).Seconds(), "observed duration %fs should cover the CleanTombstones call (>= %fs)", timer.observed[0], (delay / 2).Seconds())
 }
 
 // mockCompactorFailing creates a new empty block on every write and fails when reached the max allowed total.
