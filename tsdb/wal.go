@@ -567,7 +567,8 @@ func (w *SegmentWAL) cut() error {
 		// Finish last segment asynchronously to not block the WAL moving along
 		// in the new segment.
 		go func() {
-			w.actorc <- func() error {
+			select {
+			case w.actorc <- func() error {
 				off, err := hf.Seek(0, io.SeekCurrent)
 				if err != nil {
 					return errors.Wrapf(err, "finish old segment %s", hf.Name())
@@ -582,6 +583,8 @@ func (w *SegmentWAL) cut() error {
 					return errors.Wrapf(err, "finish old segment %s", hf.Name())
 				}
 				return nil
+			}:
+			case <-w.stopc:
 			}
 		}()
 	}
@@ -596,8 +599,11 @@ func (w *SegmentWAL) cut() error {
 	}
 
 	go func() {
-		w.actorc <- func() error {
+		select {
+		case w.actorc <- func() error {
 			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
+		}:
+		case <-w.stopc:
 		}
 	}()
 
