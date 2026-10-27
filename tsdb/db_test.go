@@ -36,6 +36,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -953,6 +954,28 @@ func TestWALSegmentSizeOptions(t *testing.T) {
 			testFunc(dbDir, int(opts.WALSegmentSize))
 		})
 	}
+}
+
+// TestCleanTombstonesDurationObserved checks that the cleanup timer covers the
+// whole CleanTombstones call, here including time spent waiting on db.mtx.
+func TestCleanTombstonesDurationObserved(t *testing.T) {
+	const hold = 100 * time.Millisecond
+	db := openTestDB(t, nil, nil)
+	defer func() {
+		testutil.Ok(t, db.Close())
+	}()
+
+	db.mtx.Lock()
+	errc := make(chan error, 1)
+	go func() { errc <- db.CleanTombstones() }()
+	time.Sleep(hold)
+	db.mtx.Unlock()
+	testutil.Ok(t, <-errc)
+
+	var m dto.Metric
+	testutil.Ok(t, db.metrics.tombCleanTimer.Write(&m))
+	testutil.Equals(t, uint64(1), m.GetHistogram().GetSampleCount())
+	testutil.Assert(t, m.GetHistogram().GetSampleSum() >= (hold/2).Seconds(), "cleanup duration %vs does not cover the CleanTombstones call", m.GetHistogram().GetSampleSum())
 }
 
 func TestTombstoneClean(t *testing.T) {
