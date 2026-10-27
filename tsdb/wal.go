@@ -566,22 +566,31 @@ func (w *SegmentWAL) cut() error {
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
 		// in the new segment.
+		finish := func() error {
+			off, err := hf.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			if err := hf.Truncate(off); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			if err := hf.Sync(); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			if err := hf.Close(); err != nil {
+				return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			}
+			return nil
+		}
 		go func() {
-			w.actorc <- func() error {
-				off, err := hf.Seek(0, io.SeekCurrent)
-				if err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
+			select {
+			case w.actorc <- finish:
+			case <-w.stopc:
+				// run() has exited, so finish the old segment here. Close()
+				// only touches the current head segment, not this one.
+				if err := finish(); err != nil {
+					level.Error(w.logger).Log("msg", "operation failed", "err", err)
 				}
-				if err := hf.Truncate(off); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				if err := hf.Sync(); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				if err := hf.Close(); err != nil {
-					return errors.Wrapf(err, "finish old segment %s", hf.Name())
-				}
-				return nil
 			}
 		}()
 	}
@@ -596,8 +605,13 @@ func (w *SegmentWAL) cut() error {
 	}
 
 	go func() {
-		w.actorc <- func() error {
+		// Give up if the WAL is closed before run() picks up the operation,
+		// otherwise this goroutine would block forever.
+		select {
+		case w.actorc <- func() error {
 			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
+		}:
+		case <-w.stopc:
 		}
 	}()
 
