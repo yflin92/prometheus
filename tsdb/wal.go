@@ -164,6 +164,7 @@ type SegmentWAL struct {
 	stopc   chan struct{}
 	donec   chan struct{}
 	actorc  chan func() error // sequentialized background operations
+	actorwg sync.WaitGroup    // goroutines handing operations to actorc
 	buffers sync.Pool
 }
 
@@ -582,7 +583,9 @@ func (w *SegmentWAL) cut() error {
 			}
 			return nil
 		}
+		w.actorwg.Add(1)
 		go func() {
+			defer w.actorwg.Done()
 			select {
 			case w.actorc <- finish:
 			case <-w.stopc:
@@ -604,7 +607,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
+	w.actorwg.Add(1)
 	go func() {
+		defer w.actorwg.Done()
 		// Give up if the WAL is closed before run() picks up the operation,
 		// otherwise this goroutine would block forever.
 		select {
@@ -729,6 +734,15 @@ func (w *SegmentWAL) Close() error {
 
 	w.mtx.Lock()
 	defer w.mtx.Unlock()
+
+	// Operations can still be buffered in actorc after run() exits. Wait for
+	// cut() goroutines to finish handing them over, then run what is left.
+	w.actorwg.Wait()
+	for len(w.actorc) > 0 {
+		if err := (<-w.actorc)(); err != nil {
+			level.Error(w.logger).Log("msg", "operation failed", "err", err)
+		}
+	}
 
 	if err := w.sync(); err != nil {
 		return err
