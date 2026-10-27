@@ -557,6 +557,45 @@ func (w *SegmentWAL) createSegmentFile(name string) (*os.File, error) {
 	return f, err
 }
 
+// enqueue hands f to run() without blocking the caller. If the WAL is closed
+// before run() picks f up, f is run directly when runOnClose is set and
+// dropped otherwise, so the handing-over goroutine never blocks forever.
+func (w *SegmentWAL) enqueue(f func() error, runOnClose bool) {
+	w.actorwg.Add(1)
+	go func() {
+		defer w.actorwg.Done()
+		select {
+		case w.actorc <- f:
+		case <-w.stopc:
+			if !runOnClose {
+				return
+			}
+			if err := f(); err != nil {
+				level.Error(w.logger).Log("msg", "operation failed", "err", err)
+			}
+		}
+	}()
+}
+
+// finishSegment truncates a no longer written segment to its written size,
+// syncs and closes it.
+func finishSegment(hf *segmentFile) error {
+	off, err := hf.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return errors.Wrapf(err, "finish old segment %s", hf.Name())
+	}
+	if err := hf.Truncate(off); err != nil {
+		return errors.Wrapf(err, "finish old segment %s", hf.Name())
+	}
+	if err := hf.Sync(); err != nil {
+		return errors.Wrapf(err, "finish old segment %s", hf.Name())
+	}
+	if err := hf.Close(); err != nil {
+		return errors.Wrapf(err, "finish old segment %s", hf.Name())
+	}
+	return nil
+}
+
 // cut finishes the currently active segments and opens the next one.
 // The encoder is reset to point to the new segment.
 func (w *SegmentWAL) cut() error {
@@ -566,36 +605,9 @@ func (w *SegmentWAL) cut() error {
 			return err
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
-		// in the new segment.
-		finish := func() error {
-			off, err := hf.Seek(0, io.SeekCurrent)
-			if err != nil {
-				return errors.Wrapf(err, "finish old segment %s", hf.Name())
-			}
-			if err := hf.Truncate(off); err != nil {
-				return errors.Wrapf(err, "finish old segment %s", hf.Name())
-			}
-			if err := hf.Sync(); err != nil {
-				return errors.Wrapf(err, "finish old segment %s", hf.Name())
-			}
-			if err := hf.Close(); err != nil {
-				return errors.Wrapf(err, "finish old segment %s", hf.Name())
-			}
-			return nil
-		}
-		w.actorwg.Add(1)
-		go func() {
-			defer w.actorwg.Done()
-			select {
-			case w.actorc <- finish:
-			case <-w.stopc:
-				// run() has exited, so finish the old segment here. Close()
-				// only touches the current head segment, not this one.
-				if err := finish(); err != nil {
-					level.Error(w.logger).Log("msg", "operation failed", "err", err)
-				}
-			}
-		}()
+		// in the new segment. If the WAL is closed first, finish it anyway:
+		// Close() only touches the current head segment, not this one.
+		w.enqueue(func() error { return finishSegment(hf) }, true)
 	}
 
 	p, _, err := nextSequenceFile(w.dirFile.Name())
@@ -607,18 +619,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
-	w.actorwg.Add(1)
-	go func() {
-		defer w.actorwg.Done()
-		// Give up if the WAL is closed before run() picks up the operation,
-		// otherwise this goroutine would block forever.
-		select {
-		case w.actorc <- func() error {
-			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
-		}:
-		case <-w.stopc:
-		}
-	}()
+	w.enqueue(func() error {
+		return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
+	}, false)
 
 	w.files = append(w.files, newSegmentFile(f))
 
