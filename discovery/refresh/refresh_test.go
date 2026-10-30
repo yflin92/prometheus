@@ -81,3 +81,27 @@ func TestRefresh(t *testing.T) {
 	case <-tick.C:
 	}
 }
+
+type recordingObserver struct {
+	observed []float64
+}
+
+func (o *recordingObserver) Observe(v float64) { o.observed = append(o.observed, v) }
+
+func TestRefreshDuration(t *testing.T) {
+	const sleep = 20 * time.Millisecond
+	refresh := func(ctx context.Context) ([]*targetgroup.Group, error) {
+		time.Sleep(sleep)
+		return nil, nil
+	}
+	d := NewDiscovery(nil, "test", time.Minute, refresh)
+	obs := &recordingObserver{}
+	d.duration = obs
+
+	_, err := d.refresh(context.Background())
+	testutil.Ok(t, err)
+
+	// The observed duration must include the time spent in refreshf.
+	testutil.Equals(t, 1, len(obs.observed))
+	testutil.Assert(t, obs.observed[0] >= sleep.Seconds(), "expected duration >= %v, got %vs", sleep, obs.observed[0])
+}

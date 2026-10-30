@@ -1095,6 +1095,38 @@ func TestTombstoneCleanFail(t *testing.T) {
 	testutil.Equals(t, expectedBlockDirs, actualBlockDirs)
 }
 
+type recordingHistogram struct {
+	prometheus.Histogram
+	observed []float64
+}
+
+func (h *recordingHistogram) Observe(v float64) { h.observed = append(h.observed, v) }
+
+// TestTombstoneCleanDuration tests that the tombstone cleanup duration metric
+// covers the whole CleanTombstones call.
+func TestTombstoneCleanDuration(t *testing.T) {
+	db := openTestDB(t, nil, nil)
+	defer func() {
+		testutil.Ok(t, db.Close())
+		testutil.Ok(t, os.RemoveAll(db.Dir()))
+	}()
+
+	timer := &recordingHistogram{Histogram: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "test"})}
+	db.metrics.tombCleanTimer = timer
+
+	// Hold the DB lock so CleanTombstones blocks after it has started its timer.
+	const hold = 100 * time.Millisecond
+	db.mtx.Lock()
+	errc := make(chan error, 1)
+	go func() { errc <- db.CleanTombstones() }()
+	time.Sleep(hold)
+	db.mtx.Unlock()
+	testutil.Ok(t, <-errc)
+
+	testutil.Equals(t, 1, len(timer.observed))
+	testutil.Assert(t, timer.observed[0] >= (hold / 2).Seconds(), "expected duration >= %v, got %vs", hold/2, timer.observed[0])
+}
+
 // mockCompactorFailing creates a new empty block on every write and fails when reached the max allowed total.
 type mockCompactorFailing struct {
 	t      *testing.T
