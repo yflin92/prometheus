@@ -33,6 +33,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb/encoding"
+	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
@@ -731,10 +732,10 @@ func (w *SegmentWAL) Close() error {
 		}
 	}
 
-	if err := w.dirFile.Sync(); err != nil {
-		return errors.Wrapf(err, "sync WAL dir %s", w.dirFile.Name())
-	}
-	return errors.Wrapf(w.dirFile.Close(), "closing WAL dir %s", w.dirFile.Name())
+	var merr tsdb_errors.MultiError
+	merr.Add(errors.Wrapf(w.dirFile.Sync(), "sync WAL dir %s", w.dirFile.Name()))
+	merr.Add(errors.Wrapf(w.dirFile.Close(), "closing WAL dir %s", w.dirFile.Name()))
+	return merr.Err()
 }
 
 func (w *SegmentWAL) write(t WALEntryType, flag uint8, buf []byte) error {
