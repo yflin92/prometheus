@@ -595,9 +595,13 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
+	// Skip the directory sync if the WAL is closed first; Close syncs the directory itself.
 	go func() {
-		w.actorc <- func() error {
+		select {
+		case w.actorc <- func() error {
 			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
+		}:
+		case <-w.stopc:
 		}
 	}()
 
@@ -727,6 +731,9 @@ func (w *SegmentWAL) Close() error {
 		}
 	}
 
+	if err := w.dirFile.Sync(); err != nil {
+		return errors.Wrapf(err, "sync WAL dir %s", w.dirFile.Name())
+	}
 	return errors.Wrapf(w.dirFile.Close(), "closing WAL dir %s", w.dirFile.Name())
 }
 
