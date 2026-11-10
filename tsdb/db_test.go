@@ -36,6 +36,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -50,7 +51,12 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m,
+		// The deprecated SegmentWAL finishes old segments asynchronously and these
+		// goroutines can outlive Close.
+		goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func1"),
+		goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func2"),
+	)
 }
 
 func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB) {
@@ -1049,6 +1055,47 @@ func TestTombstoneClean(t *testing.T) {
 			testutil.Equals(t, tombstones.NewMemTombstones(), b.tombstones)
 		}
 	}
+}
+
+// TestTombstoneCleanDuration ensures that the tombstone cleanup timer
+// observes the time spent cleaning tombstones.
+func TestTombstoneCleanDuration(t *testing.T) {
+	db := openTestDB(t, nil, nil)
+
+	app := db.Appender()
+	for i := int64(0); i < 10; i++ {
+		_, err := app.Add(labels.Labels{{Name: "a", Value: "b"}}, i, rand.Float64())
+		testutil.Ok(t, err)
+	}
+	testutil.Ok(t, app.Commit())
+
+	// Persist the head as a block so that it has tombstones to clean.
+	snap, err := ioutil.TempDir("", "snap")
+	testutil.Ok(t, err)
+	defer func() {
+		testutil.Ok(t, os.RemoveAll(snap))
+	}()
+	testutil.Ok(t, db.Snapshot(snap, true))
+	testutil.Ok(t, db.Close())
+
+	db, err = Open(snap, nil, nil, nil)
+	testutil.Ok(t, err)
+	defer func() {
+		testutil.Ok(t, db.Close())
+	}()
+	testutil.Ok(t, db.Delete(1, 7, labels.MustNewMatcher(labels.MatchEqual, "a", "b")))
+
+	start := time.Now()
+	testutil.Ok(t, db.CleanTombstones())
+	elapsed := time.Since(start)
+
+	var m dto.Metric
+	testutil.Ok(t, db.metrics.tombCleanTimer.Write(&m))
+	testutil.Equals(t, uint64(1), m.GetHistogram().GetSampleCount())
+	// The timer starts after acquiring the compaction lock, so it observes
+	// nearly all of the elapsed time spent rewriting the block.
+	observed := m.GetHistogram().GetSampleSum()
+	testutil.Assert(t, observed >= elapsed.Seconds()/2, "expected tombstone cleanup duration of about %v, got %vs", elapsed, observed)
 }
 
 // TestTombstoneCleanFail tests that a failing TombstoneClean doesn't leave any blocks behind.
