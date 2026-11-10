@@ -89,6 +89,15 @@ func TestRefreshDuration(t *testing.T) {
 		mech  = "test_refresh_duration"
 		delay = 50 * time.Millisecond
 	)
+	// The summary is package-global, so compare against its state before the
+	// refresh to keep the test valid across repeated runs.
+	summary := func() *dto.Summary {
+		var m dto.Metric
+		testutil.Ok(t, duration.WithLabelValues(mech).(prometheus.Metric).Write(&m))
+		return m.GetSummary()
+	}
+	before := summary()
+
 	d := NewDiscovery(nil, mech, time.Hour, func(context.Context) ([]*targetgroup.Group, error) {
 		time.Sleep(delay)
 		return nil, nil
@@ -96,9 +105,8 @@ func TestRefreshDuration(t *testing.T) {
 	_, err := d.refresh(context.Background())
 	testutil.Ok(t, err)
 
-	var m dto.Metric
-	testutil.Ok(t, duration.WithLabelValues(mech).(prometheus.Metric).Write(&m))
-	testutil.Equals(t, uint64(1), m.GetSummary().GetSampleCount())
-	observed := m.GetSummary().GetSampleSum()
+	after := summary()
+	testutil.Equals(t, before.GetSampleCount()+1, after.GetSampleCount())
+	observed := after.GetSampleSum() - before.GetSampleSum()
 	testutil.Assert(t, observed >= delay.Seconds(), "expected refresh duration of at least %v, got %vs", delay, observed)
 }
