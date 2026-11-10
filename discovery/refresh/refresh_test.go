@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/discovery/targetgroup"
@@ -80,4 +82,23 @@ func TestRefresh(t *testing.T) {
 		t.Fatal("Unexpected target group")
 	case <-tick.C:
 	}
+}
+
+func TestRefreshDuration(t *testing.T) {
+	const (
+		mech  = "test_refresh_duration"
+		delay = 50 * time.Millisecond
+	)
+	d := NewDiscovery(nil, mech, time.Hour, func(context.Context) ([]*targetgroup.Group, error) {
+		time.Sleep(delay)
+		return nil, nil
+	})
+	_, err := d.refresh(context.Background())
+	testutil.Ok(t, err)
+
+	var m dto.Metric
+	testutil.Ok(t, duration.WithLabelValues(mech).(prometheus.Metric).Write(&m))
+	testutil.Equals(t, uint64(1), m.GetSummary().GetSampleCount())
+	observed := m.GetSummary().GetSampleSum()
+	testutil.Assert(t, observed >= delay.Seconds(), "expected refresh duration of at least %v, got %vs", delay, observed)
 }
