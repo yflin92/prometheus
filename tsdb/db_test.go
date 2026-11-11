@@ -36,6 +36,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -1093,6 +1094,47 @@ func TestTombstoneCleanFail(t *testing.T) {
 	actualBlockDirs, err := blockDirs(db.dir)
 	testutil.Ok(t, err)
 	testutil.Equals(t, expectedBlockDirs, actualBlockDirs)
+}
+
+func TestCleanTombstonesDuration(t *testing.T) {
+	db := openTestDB(t, nil, nil)
+	defer func() {
+		testutil.Ok(t, db.Close())
+	}()
+
+	block, err := OpenBlock(nil, createBlock(t, db.Dir(), genSeries(1, 1, 0, 1)), nil)
+	testutil.Ok(t, err)
+	tomb := tombstones.NewMemTombstones()
+	tomb.AddInterval(0, tombstones.Interval{Mint: 0, Maxt: 1})
+	block.tombstones = tomb
+	db.blocks = append(db.blocks, block)
+
+	const delay = 50 * time.Millisecond
+	db.compactor = &mockCompactorSlow{delay: delay}
+	testutil.NotOk(t, db.CleanTombstones())
+
+	// The duration must be measured when CleanTombstones returns, not when it starts.
+	m := &dto.Metric{}
+	testutil.Ok(t, db.metrics.tombCleanTimer.Write(m))
+	testutil.Equals(t, uint64(1), m.GetHistogram().GetSampleCount())
+	sum := m.GetHistogram().GetSampleSum()
+	testutil.Assert(t, sum >= delay.Seconds(), "expected tombstone cleanup duration of at least %v, got %vs", delay, sum)
+}
+
+// mockCompactorSlow sleeps on every write and then fails, so no block is written.
+type mockCompactorSlow struct {
+	delay time.Duration
+}
+
+func (*mockCompactorSlow) Plan(dir string) ([]string, error) {
+	return nil, nil
+}
+func (c *mockCompactorSlow) Write(dest string, b BlockReader, mint, maxt int64, parent *BlockMeta) (ulid.ULID, error) {
+	time.Sleep(c.delay)
+	return ulid.ULID{}, fmt.Errorf("mockCompactorSlow does not write blocks")
+}
+func (*mockCompactorSlow) Compact(dest string, dirs []string, open []*Block) (ulid.ULID, error) {
+	return ulid.ULID{}, nil
 }
 
 // mockCompactorFailing creates a new empty block on every write and fails when reached the max allowed total.
