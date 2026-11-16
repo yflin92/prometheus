@@ -164,6 +164,7 @@ type SegmentWAL struct {
 	stopc   chan struct{}
 	donec   chan struct{}
 	actorc  chan func() error // sequentialized background operations
+	actorWg sync.WaitGroup    // tracks goroutines still sending to actorc
 	buffers sync.Pool
 }
 
@@ -558,7 +559,16 @@ func (w *SegmentWAL) createSegmentFile(name string) (*os.File, error) {
 
 // cut finishes the currently active segments and opens the next one.
 // The encoder is reset to point to the new segment.
+// It must be called with w.mtx held.
 func (w *SegmentWAL) cut() error {
+	// Close closes stopc under w.mtx, so once it is closed no new actor
+	// operations may be enqueued while drainActor waits for them.
+	select {
+	case <-w.stopc:
+		return errors.New("WAL is closed")
+	default:
+	}
+
 	// Sync current head to disk and close.
 	if hf := w.head(); hf != nil {
 		if err := w.flush(); err != nil {
@@ -566,7 +576,9 @@ func (w *SegmentWAL) cut() error {
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
 		// in the new segment.
+		w.actorWg.Add(1)
 		go func() {
+			defer w.actorWg.Done()
 			w.actorc <- func() error {
 				off, err := hf.Seek(0, io.SeekCurrent)
 				if err != nil {
@@ -595,7 +607,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
+	w.actorWg.Add(1)
 	go func() {
+		defer w.actorWg.Done()
 		w.actorc <- func() error {
 			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
 		}
@@ -688,6 +702,7 @@ func (w *SegmentWAL) run(interval time.Duration) {
 		}
 		select {
 		case <-w.stopc:
+			w.drainActor()
 			return
 		case f := <-w.actorc:
 			if err := f(); err != nil {
@@ -701,16 +716,43 @@ func (w *SegmentWAL) run(interval time.Duration) {
 	}
 }
 
+// drainActor runs the operations that are still being sent to actorc so that
+// their senders do not block forever once the run loop stops.
+func (w *SegmentWAL) drainActor() {
+	sent := make(chan struct{})
+	go func() {
+		w.actorWg.Wait()
+		close(sent)
+	}()
+	for {
+		select {
+		case f := <-w.actorc:
+			if err := f(); err != nil {
+				level.Error(w.logger).Log("msg", "operation failed", "err", err)
+			}
+		case <-sent:
+			if len(w.actorc) == 0 {
+				return
+			}
+		}
+	}
+}
+
 // Close syncs all data and closes the underlying resources.
 func (w *SegmentWAL) Close() error {
 	// Make sure you can call Close() multiple times.
+	w.mtx.Lock()
 	select {
 	case <-w.stopc:
+		w.mtx.Unlock()
 		return nil // Already closed.
 	default:
 	}
-
+	// Close stopc under w.mtx so it is ordered after any cut() that is still
+	// enqueueing actor operations. The lock is released before waiting on
+	// donec because the run loop's periodic Sync acquires it.
 	close(w.stopc)
+	w.mtx.Unlock()
 	<-w.donec
 
 	w.mtx.Lock()
