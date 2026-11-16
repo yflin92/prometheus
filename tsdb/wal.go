@@ -559,7 +559,16 @@ func (w *SegmentWAL) createSegmentFile(name string) (*os.File, error) {
 
 // cut finishes the currently active segments and opens the next one.
 // The encoder is reset to point to the new segment.
+// It must be called with w.mtx held.
 func (w *SegmentWAL) cut() error {
+	// Close closes stopc under w.mtx, so once it is closed no new actor
+	// operations may be enqueued while drainActor waits for them.
+	select {
+	case <-w.stopc:
+		return errors.New("WAL is closed")
+	default:
+	}
+
 	// Sync current head to disk and close.
 	if hf := w.head(); hf != nil {
 		if err := w.flush(); err != nil {
@@ -732,13 +741,18 @@ func (w *SegmentWAL) drainActor() {
 // Close syncs all data and closes the underlying resources.
 func (w *SegmentWAL) Close() error {
 	// Make sure you can call Close() multiple times.
+	w.mtx.Lock()
 	select {
 	case <-w.stopc:
+		w.mtx.Unlock()
 		return nil // Already closed.
 	default:
 	}
-
+	// Close stopc under w.mtx so it is ordered after any cut() that is still
+	// enqueueing actor operations. The lock is released before waiting on
+	// donec because the run loop's periodic Sync acquires it.
 	close(w.stopc)
+	w.mtx.Unlock()
 	<-w.donec
 
 	w.mtx.Lock()
