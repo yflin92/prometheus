@@ -164,6 +164,7 @@ type SegmentWAL struct {
 	stopc   chan struct{}
 	donec   chan struct{}
 	actorc  chan func() error // sequentialized background operations
+	actorWg sync.WaitGroup    // tracks goroutines still sending to actorc
 	buffers sync.Pool
 }
 
@@ -566,7 +567,9 @@ func (w *SegmentWAL) cut() error {
 		}
 		// Finish last segment asynchronously to not block the WAL moving along
 		// in the new segment.
+		w.actorWg.Add(1)
 		go func() {
+			defer w.actorWg.Done()
 			w.actorc <- func() error {
 				off, err := hf.Seek(0, io.SeekCurrent)
 				if err != nil {
@@ -595,7 +598,9 @@ func (w *SegmentWAL) cut() error {
 		return err
 	}
 
+	w.actorWg.Add(1)
 	go func() {
+		defer w.actorWg.Done()
 		w.actorc <- func() error {
 			return errors.Wrap(w.dirFile.Sync(), "sync WAL directory")
 		}
@@ -688,6 +693,7 @@ func (w *SegmentWAL) run(interval time.Duration) {
 		}
 		select {
 		case <-w.stopc:
+			w.drainActor()
 			return
 		case f := <-w.actorc:
 			if err := f(); err != nil {
@@ -696,6 +702,28 @@ func (w *SegmentWAL) run(interval time.Duration) {
 		case <-tick:
 			if err := w.Sync(); err != nil {
 				level.Error(w.logger).Log("msg", "sync failed", "err", err)
+			}
+		}
+	}
+}
+
+// drainActor runs the operations that are still being sent to actorc so that
+// their senders do not block forever once the run loop stops.
+func (w *SegmentWAL) drainActor() {
+	sent := make(chan struct{})
+	go func() {
+		w.actorWg.Wait()
+		close(sent)
+	}()
+	for {
+		select {
+		case f := <-w.actorc:
+			if err := f(); err != nil {
+				level.Error(w.logger).Log("msg", "operation failed", "err", err)
+			}
+		case <-sent:
+			if len(w.actorc) == 0 {
+				return
 			}
 		}
 	}
