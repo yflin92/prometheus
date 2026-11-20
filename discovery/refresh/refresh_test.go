@@ -81,3 +81,26 @@ func TestRefresh(t *testing.T) {
 	case <-tick.C:
 	}
 }
+
+type durationObserver struct {
+	observed float64
+}
+
+func (o *durationObserver) Observe(v float64) { o.observed = v }
+
+// TestRefreshObservesDuration ensures the refresh duration metric measures
+// the refresh call rather than being evaluated when it is deferred.
+func TestRefreshObservesDuration(t *testing.T) {
+	const delay = 50 * time.Millisecond
+	refresh := func(ctx context.Context) ([]*targetgroup.Group, error) {
+		time.Sleep(delay)
+		return nil, nil
+	}
+	d := NewDiscovery(nil, "test", time.Hour, refresh)
+	obs := &durationObserver{}
+	d.duration = obs
+
+	_, err := d.refresh(context.Background())
+	testutil.Ok(t, err)
+	testutil.Assert(t, obs.observed >= delay.Seconds(), "observed duration %vs, want >= %vs", obs.observed, delay.Seconds())
+}

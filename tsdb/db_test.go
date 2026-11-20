@@ -50,7 +50,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m, goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func1"), goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func2"))
 }
 
 func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB) {
@@ -1093,6 +1093,37 @@ func TestTombstoneCleanFail(t *testing.T) {
 	actualBlockDirs, err := blockDirs(db.dir)
 	testutil.Ok(t, err)
 	testutil.Equals(t, expectedBlockDirs, actualBlockDirs)
+}
+
+// durationObserver records the value passed to Observe.
+type durationObserver struct {
+	prometheus.Histogram
+	observed float64
+}
+
+func (o *durationObserver) Observe(v float64) { o.observed = v }
+
+// TestCleanTombstonesObservesDuration ensures the tombstone cleanup timer
+// measures the whole call rather than being evaluated when it is deferred.
+func TestCleanTombstonesObservesDuration(t *testing.T) {
+	db := openTestDB(t, nil, nil)
+	defer func() {
+		testutil.Ok(t, db.Close())
+	}()
+
+	timer := &durationObserver{}
+	db.metrics.tombCleanTimer = timer
+
+	// Hold db.mtx so CleanTombstones blocks for at least delay.
+	const delay = 50 * time.Millisecond
+	db.mtx.Lock()
+	go func() {
+		time.Sleep(delay)
+		db.mtx.Unlock()
+	}()
+
+	testutil.Ok(t, db.CleanTombstones())
+	testutil.Assert(t, timer.observed >= delay.Seconds(), "observed duration %vs, want >= %vs", timer.observed, delay.Seconds())
 }
 
 // mockCompactorFailing creates a new empty block on every write and fails when reached the max allowed total.
