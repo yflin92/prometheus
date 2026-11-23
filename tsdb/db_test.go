@@ -50,7 +50,12 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m,
+		// The deprecated SegmentWAL hands segment finalisation to its actor
+		// goroutine asynchronously; these sends may outlive a closed WAL.
+		goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func1"),
+		goleak.IgnoreTopFunction("github.com/prometheus/prometheus/tsdb.(*SegmentWAL).cut.func2"),
+	)
 }
 
 func openTestDB(t testing.TB, opts *Options, rngs []int64) (db *DB) {
@@ -1049,6 +1054,54 @@ func TestTombstoneClean(t *testing.T) {
 			testutil.Equals(t, tombstones.NewMemTombstones(), b.tombstones)
 		}
 	}
+}
+
+func TestTombstoneCleanObservesDuration(t *testing.T) {
+	db := openTestDB(t, nil, nil)
+	defer func() {
+		testutil.Ok(t, db.Close())
+	}()
+
+	blockDir := createBlock(t, db.Dir(), genSeries(1, 1, 0, 1))
+	block, err := OpenBlock(nil, blockDir, nil)
+	testutil.Ok(t, err)
+	// Add a fake tombstone so the block gets rewritten.
+	tomb := tombstones.NewMemTombstones()
+	tomb.AddInterval(0, tombstones.Interval{Mint: 0, Maxt: 1})
+	block.tombstones = tomb
+	db.blocks = append(db.blocks, block)
+
+	const delay = 20 * time.Millisecond
+	db.compactor = &mockCompactorDelayed{Compactor: db.compactor, delay: delay}
+	timer := &observedHistogram{Histogram: db.metrics.tombCleanTimer}
+	db.metrics.tombCleanTimer = timer
+
+	testutil.Ok(t, db.CleanTombstones())
+
+	testutil.Equals(t, 1, len(timer.observed))
+	testutil.Assert(t, timer.observed[0] >= delay.Seconds(), "observed duration %vs is shorter than the %v block rewrite", timer.observed[0], delay)
+}
+
+// mockCompactorDelayed sleeps for delay before every Write.
+type mockCompactorDelayed struct {
+	Compactor
+	delay time.Duration
+}
+
+func (c *mockCompactorDelayed) Write(dest string, b BlockReader, mint, maxt int64, parent *BlockMeta) (ulid.ULID, error) {
+	time.Sleep(c.delay)
+	return c.Compactor.Write(dest, b, mint, maxt, parent)
+}
+
+// observedHistogram records every value passed to Observe.
+type observedHistogram struct {
+	prometheus.Histogram
+	observed []float64
+}
+
+func (h *observedHistogram) Observe(v float64) {
+	h.observed = append(h.observed, v)
+	h.Histogram.Observe(v)
 }
 
 // TestTombstoneCleanFail tests that a failing TombstoneClean doesn't leave any blocks behind.
